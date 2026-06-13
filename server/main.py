@@ -1,31 +1,30 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import asyncio
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse 
 
 app = FastAPI()
 
-class Item(BaseModel):
-	text: str
-	is_done: bool = False
+# Enable CORS for next.js development server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-items = []
+async def event_generator():
+	""" Generates continuous data events """
+	count = 0
+	while True:
+		await asyncio.sleep(1)
+		count += 1
 
-@app.get("/")
-def root():
-	return {"Hello": "World"}
+		# SSE Format strictly requires "data: <payload>\n\n"
+		# always separate consecutive messages with double newlines
+		yield f"data: {{'message': 'Hello from FASTAPI', 'count': {count}}}\n\n"
 
-@app.post("/items")
-def create_item(item: Item):
-	items.append(item)
-	return item
-
-@app.get("/items", response_model=list[Item])
-def list_items(limit: int=10):
-	return items[0:limit]
-
-@app.get("/items/{item_id}", response_model=Item)
-def get_item(item_id: int):
-	if item_id < len(items):
-		return items[item_id]
-	else:
-		raise HTTPException(status_code=404, detail= f"Item {item_id} Not Found")
-
+@app.get("/api/sse")
+async def sse_endpoint():
+	return StreamingResponse(event_generator(), media_type="text/event-stream")
