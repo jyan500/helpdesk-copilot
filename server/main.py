@@ -1,9 +1,17 @@
 import asyncio
+from dotenv import load_dotenv
+
+# Load .env into os.environ BEFORE anything reads it (genai.Client() picks up
+# GEMINI_API_KEY here). FastAPI/uvicorn does not auto-load .env.
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse 
+from fastapi.sse import EventSourceResponse
+from utils.client import LLMClient
 
 app = FastAPI()
+llm = LLMClient()
 
 # Enable CORS for next.js development server
 app.add_middleware(
@@ -14,17 +22,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def event_generator():
-	""" Generates continuous data events """
-	count = 0
-	while True:
-		await asyncio.sleep(1)
-		count += 1
-
-		# SSE Format strictly requires "data: <payload>\n\n"
-		# always separate consecutive messages with double newlines
-		yield f"data: {{'message': 'Hello from FASTAPI', 'count': {count}}}\n\n"
-
-@app.get("/api/sse")
-async def sse_endpoint():
-	return StreamingResponse(event_generator(), media_type="text/event-stream")
+# SSE Format strictly requires "data: <payload>\n\n"
+# always separate consecutive messages with double newlines
+# when using EventSourceResponse, this automates this for you
+@app.get("/api/chat", response_class=EventSourceResponse)
+async def chat_endpoint(message: str):
+	async for delta in llm.stream_response(message):
+		yield {"delta": delta}
+	yield {"done": True}
