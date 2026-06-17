@@ -52,12 +52,19 @@ class OrderInfo(BaseModel):
     # TODO: fields the agent needs to answer order questions.
     #   Suggested: id: int, status: str, item: str,
     #              total_amount: Decimal, created_at: datetime
-    ...
+    id: int
+    status: str
+    item: str
+    total_amount: Decimal
+    created_at: datetime
 
 
 class SubscriptionInfo(BaseModel):
     # TODO: id: int, plan: str, status: str, current_period_end: datetime
-    ...
+    id: int
+    plan: str
+    status: str
+    current_period_end: datetime
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +83,14 @@ async def get_customer(session: AsyncSession, email: str) -> dict:
             return {"found": True, **info.model_dump(mode="json")}
     """
     # TODO: implement per the pointers above.
-    ...
+    stmt = select(Customer).where(Customer.email == email)
+    result = await session.execute(stmt)
+    customer = result.scalar_one_or_none()
+    if not Customer:
+        return {"found": False, "email": email}
+    else:
+        info = CustomerInfo(id=customer.id, name=customer.name, email=customer.email)
+        return {"found": True, **info.model_dump(mode="json")}
 
 
 async def get_orders(session: AsyncSession, customer_id: int) -> dict:
@@ -91,14 +105,38 @@ async def get_orders(session: AsyncSession, customer_id: int) -> dict:
         unambiguous for the model — see Carol, who has no orders.)
     """
     # TODO: implement per the pointers above.
-    ...
+    stmt = select(Order).where(Order.customer_id == customer_id).order_by(Order.created_at.desc())
+    result = await session.execute(stmt)
+    orders = result.scalars().all()
+    shaped = []
+    for order in orders:
+        shaped.append(OrderInfo(
+            id=order.id, 
+            status=order.status, 
+            item=order.item, 
+            total_amount=order.total_amount, 
+            created_at=order.created_at
+        ).model_dump(mode="json"))
+    return {"customer_id": customer_id, "count": len(shaped), "orders": shaped}
 
 
 async def get_subscription(session: AsyncSession, customer_id: int) -> dict:
     """The customer's subscription(s). Mirror get_orders' shape/approach."""
     # TODO: select(Subscription).where(...), shape via SubscriptionInfo,
     #       return {"customer_id":..., "count":..., "subscriptions":[...]}.
-    ...
+    stmt = select(Subscription).where(Subscription.customer_id == customer_id).order_by(Subscription.created_at.desc())
+    result = await session.execute(stmt)
+    subscriptions = result.scalars().all()
+    shaped = []
+    for subscription in subscriptions:
+        shaped.append(SubscriptionInfo(
+            id=subscription.id,
+            plan=subscription.plan,
+            status=subscription.status,
+            current_period_end=subscription.current_period_end
+        ).model_dump(mode="json"))
+    return {"customer_id": customer_id, "count": len(shaped), "subscriptions": shaped}
+
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +181,45 @@ get_customer_decl = types.FunctionDeclaration(
 )
 
 # TODO: get_orders_decl = types.FunctionDeclaration(name="get_orders", ...)
+get_orders_decl = types.FunctionDeclaration(
+    name="get_orders",
+    description=(
+        "Look up all of a customers' order by customer id. Returns a list of orders."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "customer_id": types.Schema(
+                type=types.Type.INTEGER,
+                description="The customer's id"
+            )
+        },
+        required=["customer_id"]
+    )
+)
 # TODO: get_subscription_decl = types.FunctionDeclaration(name="get_subscription", ...)
+get_subscription_decl = types.FunctionDeclaration(
+    name="get_subscription",
+    description=(
+        "Look up all of a customers' subscriptions by customer id. Returns a list of subscriptions."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "customer_id": types.Schema(
+                type=types.Type.INTEGER,
+                description="The customer's id"
+            )
+        },
+        required=["customer_id"]
+    )
+)
 
 # TODO: collect all three declarations into this list (step 6 passes it to the model).
 ACCOUNT_TOOL_DECLS = [
     get_customer_decl,
-    # get_orders_decl,
-    # get_subscription_decl,
+    get_orders_decl,
+    get_subscription_decl,
 ]
 
 
@@ -167,8 +237,10 @@ if __name__ == "__main__":
             cust = await get_customer(session, "alice@example.com")
             print("get_customer:", cust)
             # TODO: once get_orders works, look up alice's id and print her orders:
-            #   orders = await get_orders(session, cust["id"])
-            #   print("latest order:", orders["orders"][0])
+            orders = await get_orders(session, cust["id"])
+            print("latest order:", orders["orders"][0])
+            subscriptions = await get_subscription(session, cust["id"])
+            print("latest subscription: ", subscriptions["subscriptions"][0])
         await engine.dispose()
 
     asyncio.run(_smoke())
