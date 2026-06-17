@@ -38,6 +38,7 @@ htmlcov/
 # Database (local SQLite, dumps)
 *.db
 *.sqlite3
+db/setup.sql
 
 # Editor / OS
 .idea/
