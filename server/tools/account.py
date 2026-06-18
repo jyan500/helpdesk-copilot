@@ -86,7 +86,7 @@ async def get_customer(session: AsyncSession, email: str) -> dict:
     stmt = select(Customer).where(Customer.email == email)
     result = await session.execute(stmt)
     customer = result.scalar_one_or_none()
-    if not Customer:
+    if not customer:
         return {"found": False, "email": email}
     else:
         info = CustomerInfo(id=customer.id, name=customer.name, email=customer.email)
