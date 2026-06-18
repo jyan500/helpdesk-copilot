@@ -92,16 +92,18 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
         # TODO: if there is NO function call -> the model answered. Return the
         #   final text (join any text parts) and stop.
         function_call = None
+        final_text = []
         for part in model_turn.parts:
             if part.function_call:
                 print(f"function call: name {part.function_call.name} args: {part.function_call.args}")
                 function_call = part.function_call
             elif part.text:
                 print(f"text:  {part.text}")
+                final_text.append(part.text)
 
         if not function_call:
             print("No tool call - model answered directly, nothing to run.")
-            return
+            return "\n".join(final_text)
 
         # TODO: DISPATCH — the Phase 2 twist is async + injected session:
         #   fn = TOOLS[function_call.name]
@@ -124,6 +126,116 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
 
     # Hit the cap without the model settling on an answer.
     return "Sorry — I couldn't complete that within the step limit."
+
+
+# ===========================================================================
+# STREAMING version (Phase 2, step 7) — SCAFFOLD. Fill in the TODOs.
+#
+# Same loop as run_account_agent above, but instead of RETURNING one string it's
+# an async GENERATOR that YIELDS events as they happen, so the browser can show
+# progress and a typewriter answer over SSE. Keep run_account_agent above as your
+# non-streaming reference — this is its streaming sibling.
+#
+# The event contract (each yielded dict becomes one SSE message; the endpoint
+# passes it straight through, the frontend switches on event["type"]):
+#     {"type": "tool",  "name": str, "args": dict}   # a tool is being run (loading)
+#     {"type": "delta", "text": str}                 # a chunk of the answer
+#     {"type": "done"}                               # finished
+#
+# TWO things change vs the non-streaming loop:
+#   1. await client.aio.models.generate_content_stream(...) instead of
+#      generate_content(...). It returns an ASYNC ITERATOR of partial chunks, so
+#      you consume it with `async for chunk in stream:`.
+#   2. You don't have a tidy `model_turn` object handed to you anymore. For a
+#      tool-call turn, rebuild the history turn yourself from the function_call:
+#          types.Content(role="model", parts=[types.Part(function_call=fc)])
+#
+# Caveat to know (fine to ignore for Phase 2): if a turn streams some "thinking"
+# text AND then a tool call, you'll have already yielded that text as deltas.
+# For this app the model almost always either answers OR calls a tool, so it's
+# rarely an issue; cleanly separating "thoughts" from "answer" is a Phase 6 job.
+# ===========================================================================
+async def stream_account_agent(message: str, session: AsyncSession):
+    """Async generator: yields {type: tool|delta|done} events (see contract above)."""
+    client = genai.Client()
+
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(function_declarations=ACCOUNT_TOOL_DECLS)],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        max_output_tokens=1000,
+        system_instruction=ACCOUNT_SYSTEM_PROMPT,
+    )
+
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=message)]),
+    ]
+
+    for i in range(MAX_ITERS):
+        # TODO: open the streaming call (note: generate_content_STREAM, and it's
+        #   awaited because we're on the async client):
+        stream = await client.aio.models.generate_content_stream(
+        model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
+
+        function_call = None
+        # TODO: consume the stream chunk by chunk:
+        #     async for chunk in stream:
+        #         for part in chunk.candidates[0].content.parts:
+        #             if part.function_call:
+        #                 function_call = part.function_call
+        #             elif part.text:
+        #                 yield {"type": "delta", "text": part.text}   # live token
+        #   (yielding text as it arrives is what gives the typewriter effect.)
+        async for chunk in stream:
+            for part in chunk.candidates[0].content.parts:
+                if part.function_call:
+                    function_call = part.function_call
+                elif part.text:
+                    yield {"type": "delta", "text": part.text}
+
+        # TODO: no tool call this turn => the model answered. Signal completion
+        #   and stop the generator:
+        #     if function_call is None:
+        #         yield {"type": "done"}
+        #         return
+        if function_call is None:
+            yield {"type": "done"}
+            return
+
+        # TODO: there IS a tool call => tell the UI, then run it (async + session):
+        #     yield {"type": "tool", "name": function_call.name,
+        #            "args": dict(function_call.args)}
+        #     result = await TOOLS[function_call.name](session, **function_call.args)
+        #     print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
+        yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
+        result = await TOOLS[function_call.name](session, **function_call.args)
+        print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
+
+        # TODO: feed the result back — same two-append pattern, but REBUILD the
+        #   model turn yourself (streaming didn't hand you one):
+        #     contents.append(types.Content(
+        #         role="model", parts=[types.Part(function_call=function_call)]))
+        #     contents.append(types.Content(role="user", parts=[
+        #         types.Part.from_function_response(
+        #             name=function_call.name, response={"result": result})]))
+
+        # NOTE: single-call only — see Phase 4 
+        contents.append(types.Content(
+            role="model",
+            parts=[types.Part(function_call=function_call)]
+        ))
+        contents.append(types.Content(
+            role="user",
+            parts=[
+                types.Part.from_function_response(
+                    name=function_call.name, response={"result": result}
+                )
+            ]
+        ))
+
+    # Hit the iteration cap without a final answer.
+    yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
+    yield {"type": "done"}
+
 
 if __name__ == "__main__":
     import asyncio
