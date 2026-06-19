@@ -30,6 +30,7 @@ from tools.account import ACCOUNT_TOOL_DECLS, TOOLS
 from utils.constants import GEMINI_FLASH_LITE_MODEL
 
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
+EMPTY_RETRY_LIMIT = 2 # if the LLM client comes back with an empty response, allow for retries
 
 ACCOUNT_SYSTEM_PROMPT = (
     # TODO: write the Account-agent instructions. Things worth telling it:
@@ -66,14 +67,15 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
         tools=[types.Tool(function_declarations=ACCOUNT_TOOL_DECLS)],
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         max_output_tokens=1000,
-        system_instruction=ACCOUNT_SYSTEM_PROMPT
+        system_instruction=ACCOUNT_SYSTEM_PROMPT,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
     # Conversation history we GROW each turn (same idea as Phase 1's `contents`).
     contents: list[types.Content] = [
         types.Content(role="user", parts=[types.Part(text=message)]),
     ]
-
+    empty_retries = 0
     for i in range(MAX_ITERS):
         # TODO (port from Phase 1, now ASYNC):
         #   response = await client.aio.models.generate_content(
@@ -88,12 +90,13 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
         # TODO: pull out the model's turn and scan its parts for a function_call
         #   (and log any text). Remember a turn can contain text AND a call.
         model_turn = response.candidates[0].content
+        parts = model_turn.parts if (model_turn and model_turn.parts) else []
 
         # TODO: if there is NO function call -> the model answered. Return the
         #   final text (join any text parts) and stop.
         function_call = None
         final_text = []
-        for part in model_turn.parts:
+        for part in parts:
             if part.function_call:
                 print(f"function call: name {part.function_call.name} args: {part.function_call.args}")
                 function_call = part.function_call
@@ -102,8 +105,12 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
                 final_text.append(part.text)
 
         if not function_call:
-            print("No tool call - model answered directly, nothing to run.")
-            return "\n".join(final_text)
+            if final_text:
+                return "\n".join(final_text)
+            empty_retries += 1
+            if empty_retries <= EMPTY_RETRY_LIMIT:
+                continue
+            return "Sorry, I couldn't generate a response. Please try again."
 
         # TODO: DISPATCH — the Phase 2 twist is async + injected session:
         #   fn = TOOLS[function_call.name]
@@ -111,7 +118,6 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
         #   print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
         fn = TOOLS[function_call.name]
         result = await fn(session, **function_call.args)
-        print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
 
         # TODO: FEED THE RESULT BACK — same two-append pattern as Phase 1:
         # both the model turn, and the result of the function
@@ -164,12 +170,14 @@ async def stream_account_agent(message: str, session: AsyncSession):
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         max_output_tokens=1000,
         system_instruction=ACCOUNT_SYSTEM_PROMPT,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
     contents: list[types.Content] = [
         types.Content(role="user", parts=[types.Part(text=message)]),
     ]
 
+    empty_retries = 0
     for i in range(MAX_ITERS):
         # TODO: open the streaming call (note: generate_content_STREAM, and it's
         #   awaited because we're on the async client):
@@ -177,6 +185,7 @@ async def stream_account_agent(message: str, session: AsyncSession):
         model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
 
         function_call = None
+        produced_text = False
         # TODO: consume the stream chunk by chunk:
         #     async for chunk in stream:
         #         for part in chunk.candidates[0].content.parts:
@@ -185,52 +194,62 @@ async def stream_account_agent(message: str, session: AsyncSession):
         #             elif part.text:
         #                 yield {"type": "delta", "text": part.text}   # live token
         #   (yielding text as it arrives is what gives the typewriter effect.)
+
+        # NOTE: it's NOT guaranteed that every chunk comes back with content,
+        # so it's important to check whether a chunk actually contains the parts we're looking
+        # for BEFORE we process to avoid nonetype errors
         async for chunk in stream:
-            for part in chunk.candidates[0].content.parts:
+            # some chunks have no candidates
+            cand = chunk.candidates[0] if chunk.candidates else None
+            if not chunk.candidates:
+                continue
+            content = chunk.candidates[0].content
+            # some chunks contain only metadata (i.e finish reason, usage, etc) but no parts 
+            if content is None or content.parts is None:
+                continue
+            for part in content.parts:
                 if part.function_call:
                     function_call = part.function_call
                 elif part.text:
+                    produced_text = True
                     yield {"type": "delta", "text": part.text}
 
-        # TODO: no tool call this turn => the model answered. Signal completion
-        #   and stop the generator:
-        #     if function_call is None:
-        #         yield {"type": "done"}
-        #         return
-        if function_call is None:
+        # there IS a tool call => tell the UI, then run it (async + session):
+        if function_call is not None:
+            yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
+            result = await TOOLS[function_call.name](session, **function_call.args)
+            print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
+
+            # feed the result back — same two-append pattern, but REBUILD the
+            # model turn yourself (streaming didn't hand you one):
+            # NOTE: single-call only — see Phase 4 
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(function_call=function_call)]
+            ))
+            contents.append(types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=function_call.name, response={"result": result}
+                    )
+                ]
+            ))
+            continue
+
+        if produced_text:
             yield {"type": "done"}
             return
 
-        # TODO: there IS a tool call => tell the UI, then run it (async + session):
-        #     yield {"type": "tool", "name": function_call.name,
-        #            "args": dict(function_call.args)}
-        #     result = await TOOLS[function_call.name](session, **function_call.args)
-        #     print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
-        yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
-        result = await TOOLS[function_call.name](session, **function_call.args)
-        print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
-
-        # TODO: feed the result back — same two-append pattern, but REBUILD the
-        #   model turn yourself (streaming didn't hand you one):
-        #     contents.append(types.Content(
-        #         role="model", parts=[types.Part(function_call=function_call)]))
-        #     contents.append(types.Content(role="user", parts=[
-        #         types.Part.from_function_response(
-        #             name=function_call.name, response={"result": result})]))
-
-        # NOTE: single-call only — see Phase 4 
-        contents.append(types.Content(
-            role="model",
-            parts=[types.Part(function_call=function_call)]
-        ))
-        contents.append(types.Content(
-            role="user",
-            parts=[
-                types.Part.from_function_response(
-                    name=function_call.name, response={"result": result}
-                )
-            ]
-        ))
+        # Empty turn: no tool call and no text. Retry
+        empty_retries += 1
+        if empty_retries <= EMPTY_RETRY_LIMIT:
+            print(f"[iter {i}] empty turn - retrying ({empty_retries})")
+            continue
+        print(f"iter {i}: function_call={function_call.name if function_call else None}")
+        yield {"type": "delta", "text": "Sorry, I couldn't generate a response. Please try again."}
+        yield {"type": "done"}
+        return 
 
     # Hit the iteration cap without a final answer.
     yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
@@ -245,10 +264,15 @@ if __name__ == "__main__":
     async def _smoke():
         async with AsyncSessionLocal() as session:
             # print("prompt: what is the latest subscription for notfound@example.com?")
-            # res = await run_account_agent("what is the latest subscription for notfound@example.com?", session)
-            print("prompt: what is the latest subscription for alice@example.com?")
-            res = await run_account_agent("what is the latest subscription for alice@example.com?", session)
-            print("res: ", res)
+            # res = await run_account_agent("what is the latest subscription for alice@example.com?", session)
+            # print("prompt: what is the latest subscription for alice@example.com?")
+            # res = await run_account_agent("what is the latest subscription for alice@example.com?", session)
+            # print("res: ", res)
+            async for event in stream_account_agent(
+                "what is the latest subscription for alice@example.com?",
+                session
+            ):
+                print("EVENT: ", event)
         await engine.dispose()
 
     asyncio.run(_smoke())
