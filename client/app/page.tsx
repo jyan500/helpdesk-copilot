@@ -1,6 +1,4 @@
 "use client"
-import AccountChat from "@/app/components/AccountChat"
-import KnowledgeChat from "@/app/components/KnowledgeChat"
 import OrchestratorChat from "@/app/components/OrchestratorChat"
 
 export default function Home() {

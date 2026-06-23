@@ -144,5 +144,5 @@ async def stream_orchestrator(message: str, session: AsyncSession):
         return
     else:
         agent_config = AGENTS[intent] if intent in AGENTS else AGENTS[DEFAULT_INTENT]
-        async for event in stream_agent(AGENTS[intent], message, session):
+        async for event in stream_agent(agent_config, message, session):
             yield event

@@ -253,169 +253,24 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
     return "Sorry — I couldn't complete that within the step limit."
 
 
-# ===========================================================================
-# ⚠️  PORT-THEN-DELETE (Phase 4): the two functions below are your REFERENCE for
-# writing stream_agent above. They differ ONLY in prompt / decls / registry — the
-# exact things AgentConfig now carries. Once stream_agent works and the app drives
-# everything through it (account + knowledge via AGENTS), delete both of these.
-# ===========================================================================
-async def stream_account_agent(message: str, session: AsyncSession):
-    """Async generator: yields {type: tool|delta|done} events (see contract above)."""
-    client = genai.Client()
-
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(function_declarations=ACCOUNT_TOOL_DECLS)],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        max_output_tokens=1000,
-        system_instruction=ACCOUNT_SYSTEM_PROMPT,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
-
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=message)]),
-    ]
-
-    empty_retries = 0
-    for i in range(MAX_ITERS):
-        stream = await client.aio.models.generate_content_stream(
-        model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
-
-        function_call = None
-        produced_text = False
-        async for chunk in stream:
-            # some chunks have no candidates
-            if not chunk.candidates:
-                continue
-            content = chunk.candidates[0].content
-            # some chunks contain only metadata (i.e finish reason, usage, etc) but no parts
-            if content is None or content.parts is None:
-                continue
-            for part in content.parts:
-                if part.function_call:
-                    function_call = part.function_call
-                elif part.text:
-                    produced_text = True
-                    yield {"type": "delta", "text": part.text}
-
-        # there IS a tool call => tell the UI, then run it (async + session):
-        if function_call is not None:
-            yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
-            result = await TOOLS[function_call.name](session, **function_call.args)
-            print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
-
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(function_call=function_call)]
-            ))
-            contents.append(types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_function_response(
-                        name=function_call.name, response={"result": result}
-                    )
-                ]
-            ))
-            continue
-
-        if produced_text:
-            yield {"type": "done"}
-            return
-
-        empty_retries += 1
-        if empty_retries <= EMPTY_RETRY_LIMIT:
-            print(f"[iter {i}] empty turn - retrying ({empty_retries})")
-            continue
-        yield {"type": "delta", "text": "Sorry, I couldn't generate a response. Please try again."}
-        yield {"type": "done"}
-        return
-
-    yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
-    yield {"type": "done"}
-
-
-async def stream_knowledge_agent(message: str, session: AsyncSession):
-    """Async generator: yields {type: tool|delta|done} events (same contract as
-    stream_account_agent). The Knowledge/RAG sibling of the account loop."""
-    client = genai.Client()
-
-    config = types.GenerateContentConfig(
-        tools=[types.Tool(function_declarations=KNOWLEDGE_TOOL_DECLS)],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        max_output_tokens=1000,
-        system_instruction=KNOWLEDGE_SYSTEM_PROMPT,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
-
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=message)]),
-    ]
-
-    empty_retries = 0
-    for i in range(MAX_ITERS):
-        stream = await client.aio.models.generate_content_stream(
-            model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
-
-        function_call = None
-        produced_text = False
-        async for chunk in stream:
-            if not chunk.candidates:
-                continue
-            content = chunk.candidates[0].content
-            if content is None or content.parts is None:
-                continue
-            for part in content.parts:
-                if part.function_call:
-                    function_call = part.function_call
-                elif part.text:
-                    produced_text = True
-                    yield {"type": "delta", "text": part.text}
-
-        if function_call is not None:
-            yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
-            result = await KNOWLEDGE_TOOLS[function_call.name](session, **function_call.args)
-            print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result.get('count')} chunks")
-
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(function_call=function_call)]
-            ))
-            contents.append(types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_function_response(
-                        name=function_call.name, response={"result": result}
-                    )
-                ]
-            ))
-            continue
-
-        if produced_text:
-            yield {"type": "done"}
-            return
-
-        empty_retries += 1
-        if empty_retries <= EMPTY_RETRY_LIMIT:
-            print(f"[iter {i}] empty turn - retrying ({empty_retries})")
-            continue
-        yield {"type": "delta", "text": "Sorry, I couldn't generate a response. Please try again."}
-        yield {"type": "done"}
-        return
-
-    yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
-    yield {"type": "done"}
-
-
 if __name__ == "__main__":
     import asyncio
 
     from db.session import AsyncSessionLocal, engine
 
     async def _smoke():
+        ACCOUNT_AGENT = AgentConfig(
+            name="account",
+            system_prompt=ACCOUNT_SYSTEM_PROMPT,
+            tool_decls=ACCOUNT_TOOL_DECLS,
+            tools=ACCOUNT_TOOLS,
+        )
         async with AsyncSessionLocal() as session:
             # Once stream_agent + agent/agents.py are filled in, switch this to:
             #   from agent.agents import AGENTS
             #   async for event in stream_agent(AGENTS["account"], "...", session):
-            async for event in stream_account_agent(
+            async for event in stream_agent(
+                ACCOUNT_AGENT,
                 "what is the latest subscription for alice@example.com?",
                 session
             ):
