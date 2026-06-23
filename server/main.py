@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse
 
 from agent.loop import stream_account_agent, stream_knowledge_agent
+from agent.orchestrator import stream_orchestrator
 from db.session import AsyncSessionLocal
 from utils.client import LLMClient
 
@@ -57,4 +58,16 @@ async def agent_chat_endpoint(message: str):
 async def knowledge_chat_endpoint(message: str):
 	async with AsyncSessionLocal() as session:
 		async for event in stream_knowledge_agent(message, session):
+			yield event
+
+
+# Phase 4: the ORCHESTRATOR over SSE — the single entry point the frontend should
+# use. Same per-stream session lifetime and event contract as the specialist
+# endpoints, plus the new {"type":"route", "intent":...} event. Internally it
+# classifies the message and delegates to the right specialist, so one chat box
+# now handles account + knowledge questions (and stubs action until Phase 5).
+@app.get("/api/orchestrator/chat", response_class=EventSourceResponse)
+async def orchestrator_chat_endpoint(message: str):
+	async with AsyncSessionLocal() as session:
+		async for event in stream_orchestrator(message, session):
 			yield event
