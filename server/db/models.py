@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import ForeignKey, Numeric, String, DateTime, func
+from sqlalchemy import ARRAY, Float, ForeignKey, Numeric, String, Text, DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -84,3 +84,69 @@ class Subscription(Base):
     )
 
     customer: Mapped["Customer"] = relationship(back_populates="subscriptions")
+
+
+# ===========================================================================
+# Phase 3 — Knowledge base for RAG.
+#
+# Two tables, and the split mirrors how RAG actually works:
+#
+#   Article   one help-center document, stored whole. This is what we CITE
+#             ("see: Refunds & Returns"), so the agent's answer can point a
+#             user at a real source.
+#   DocChunk  the Article sliced into small overlapping pieces, each with its
+#             OWN embedding — one of the 384-number vectors from
+#             scratch_embeddings.py. Retrieval happens at the CHUNK level; we
+#             keep a FK back to the Article so a matched chunk still knows which
+#             document — and therefore which citation — it came from.
+#
+# Why chunk at all? Embeddings capture meaning best over a focused span of
+# text. Embedding a whole article blurs many topics into one vector; embedding
+# small chunks keeps each vector "about one thing", so similarity search can
+# surface the exact paragraph that answers the question. Chunk size/overlap is
+# the main RAG-quality knob you'll experiment with in db/ingest.py.
+# ===========================================================================
+class Article(Base):
+    __tablename__ = "articles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Human-facing title, used verbatim in citations ("Refunds & Returns").
+    title: Mapped[str] = mapped_column(String(200))
+    # A stable slug/filename for the source, e.g. "refunds-and-returns".
+    slug: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    # Full original text. Handy for debugging retrieval and for showing the
+    # source; the agent never embeds this directly — it embeds the chunks.
+    body: Mapped[str] = mapped_column(Text)
+
+    # One article -> many chunks. Deleting/re-ingesting an article clears its
+    # chunks (cascade), so re-running the ingest script stays clean.
+    chunks: Mapped[list["DocChunk"]] = relationship(
+        back_populates="article", cascade="all, delete-orphan"
+    )
+
+
+class DocChunk(Base):
+    __tablename__ = "doc_chunks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id"), index=True)
+    # Position of this chunk within its article (0,1,2,...) — useful for
+    # debugging and for stitching adjacent chunks back together if you want.
+    chunk_index: Mapped[int] = mapped_column()
+    # The actual text we embedded and will hand back to the model as context.
+    content: Mapped[str] = mapped_column(Text)
+
+    # The embedding: a fixed-length vector of floats (384 for all-MiniLM-L6-v2) —
+    # exactly the kind of vector scratch_embeddings.py printed.
+    #
+    # We store it as a plain Postgres float8[] (ARRAY(Float)) for now and do the
+    # cosine-similarity search in Python (see tools/knowledge.py). That's enough
+    # for a tiny doc set and keeps the focus on the RAG concepts.
+    #
+    # The "production" path is pgvector's Vector(384) type, which does the
+    # similarity search inside the database with an index. Swapping to it later
+    # is a column-type change here (ARRAY(Float) -> Vector(384)) plus enabling
+    # the extension — deliberately deferred (see CLAUDE.md / build plan).
+    embedding: Mapped[list[float]] = mapped_column(ARRAY(Float))
+
+    article: Mapped["Article"] = relationship(back_populates="chunks")

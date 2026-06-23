@@ -27,6 +27,8 @@ from google.genai import types
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tools.account import ACCOUNT_TOOL_DECLS, TOOLS
+from tools.knowledge import KNOWLEDGE_TOOL_DECLS
+from tools.knowledge import TOOLS as KNOWLEDGE_TOOLS
 from utils.constants import GEMINI_FLASH_LITE_MODEL
 
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
@@ -252,6 +254,116 @@ async def stream_account_agent(message: str, session: AsyncSession):
         return 
 
     # Hit the iteration cap without a final answer.
+    yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
+    yield {"type": "done"}
+
+
+# ===========================================================================
+# Phase 3 — the KNOWLEDGE agent (RAG).
+#
+# This is intentionally a near-copy of stream_account_agent above: the streaming
+# tool-calling LOOP is the same machinery you already built, so we don't re-derive
+# it. Only three things differ, and they're the Phase 3 substance:
+#   1. a different tool (search_docs) + registry (KNOWLEDGE_TOOLS)
+#   2. a SYSTEM PROMPT that makes it a RAG agent: search first, answer ONLY from
+#      what came back, and CITE the article — the antidote to hallucination.
+#   3. nothing else — same event contract {type: tool|delta|done}, so the SAME
+#      frontend code can render it.
+#
+# (Yes, this duplicates the loop. That's fine for now — Phase 4 is where we factor
+# the shared loop out and let an orchestrator pick which agent/tools to use.)
+# ===========================================================================
+KNOWLEDGE_SYSTEM_PROMPT = (
+    # The whole point of RAG is grounding: the model must answer from RETRIEVED
+    # text, not its own memory, and tell the user WHERE the answer came from.
+    # Tune this wording and watch behavior change — it's a real part of the work.
+    """
+    You are a helpdesk knowledge agent. You answer "how do I..." and policy
+    questions (refunds, shipping, billing, account/login, support hours) using the
+    company's help-center articles.
+
+    Always call search_docs first to retrieve relevant article chunks, then answer
+    using ONLY the information in those chunks. Do not rely on prior knowledge or
+    invent details. If the retrieved chunks don't contain the answer, say you
+    couldn't find it in the help center rather than guessing.
+
+    Cite your source: end your answer with the title of the article you used,
+    e.g. (Source: Refunds & Returns). Be concise and answer the actual question.
+    """
+)
+
+
+async def stream_knowledge_agent(message: str, session: AsyncSession):
+    """Async generator: yields {type: tool|delta|done} events (same contract as
+    stream_account_agent). The Knowledge/RAG sibling of the account loop."""
+    client = genai.Client()
+
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(function_declarations=KNOWLEDGE_TOOL_DECLS)],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        max_output_tokens=1000,
+        system_instruction=KNOWLEDGE_SYSTEM_PROMPT,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=message)]),
+    ]
+
+    empty_retries = 0
+    for i in range(MAX_ITERS):
+        stream = await client.aio.models.generate_content_stream(
+            model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
+
+        function_call = None
+        produced_text = False
+        async for chunk in stream:
+            cand = chunk.candidates[0] if chunk.candidates else None
+            if not chunk.candidates:
+                continue
+            content = chunk.candidates[0].content
+            if content is None or content.parts is None:
+                continue
+            for part in content.parts:
+                if part.function_call:
+                    function_call = part.function_call
+                elif part.text:
+                    produced_text = True
+                    yield {"type": "delta", "text": part.text}
+
+        # Dispatch through the KNOWLEDGE registry (the only registry change vs the
+        # account loop). search_docs embeds the query + ranks chunks by similarity.
+        if function_call is not None:
+            yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
+            result = await KNOWLEDGE_TOOLS[function_call.name](session, **function_call.args)
+            print(f"[iter {i}] {function_call.name}({dict(function_call.args)}) -> {result.get('count')} chunks")
+
+            contents.append(types.Content(
+                role="model",
+                parts=[types.Part(function_call=function_call)]
+            ))
+            contents.append(types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=function_call.name, response={"result": result}
+                    )
+                ]
+            ))
+            continue
+
+        if produced_text:
+            yield {"type": "done"}
+            return
+
+        empty_retries += 1
+        if empty_retries <= EMPTY_RETRY_LIMIT:
+            print(f"[iter {i}] empty turn - retrying ({empty_retries})")
+            continue
+        yield {"type": "delta", "text": "Sorry, I couldn't generate a response. Please try again."}
+        yield {"type": "done"}
+        return
+
     yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
     yield {"type": "done"}
 

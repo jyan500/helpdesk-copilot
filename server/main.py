@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse
 
-from agent.loop import stream_account_agent
+from agent.loop import stream_account_agent, stream_knowledge_agent
 from db.session import AsyncSessionLocal
 from utils.client import LLMClient
 
@@ -47,4 +47,14 @@ async def chat_endpoint(message: str):
 async def agent_chat_endpoint(message: str):
 	async with AsyncSessionLocal() as session:
 		async for event in stream_account_agent(message, session):
+			yield event
+
+
+# Phase 3: the Knowledge agent (RAG) over SSE. Identical plumbing to the account
+# endpoint above — same per-stream session lifetime, same event contract — it just
+# drives the knowledge loop (search_docs + cite-your-sources prompt) instead.
+@app.get("/api/knowledge/chat", response_class=EventSourceResponse)
+async def knowledge_chat_endpoint(message: str):
+	async with AsyncSessionLocal() as session:
+		async for event in stream_knowledge_agent(message, session):
 			yield event
