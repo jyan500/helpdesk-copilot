@@ -9,7 +9,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse
 
-from agent.loop import stream_account_agent, stream_knowledge_agent
 from agent.orchestrator import stream_orchestrator
 from db.session import AsyncSessionLocal
 from utils.client import LLMClient
@@ -36,36 +35,16 @@ async def chat_endpoint(message: str):
 	yield {"done": True}
 
 
-# Phase 2: the Account agent over SSE. Forwards each event the agent loop yields
-# ({type: tool|delta|done}) straight to the browser.
-#
-# The DB session is opened HERE with `async with` (not Depends) so its lifetime
-# provably spans the whole stream: it opens before the first event and closes
-# only when the generator is exhausted — no reliance on framework teardown timing
-# for streamed bodies. We pass the live session into the agent so the agent itself
-# stays decoupled/testable.
-@app.get("/api/agent/chat", response_class=EventSourceResponse)
-async def agent_chat_endpoint(message: str):
-	async with AsyncSessionLocal() as session:
-		async for event in stream_account_agent(message, session):
-			yield event
-
-
-# Phase 3: the Knowledge agent (RAG) over SSE. Identical plumbing to the account
-# endpoint above — same per-stream session lifetime, same event contract — it just
-# drives the knowledge loop (search_docs + cite-your-sources prompt) instead.
-@app.get("/api/knowledge/chat", response_class=EventSourceResponse)
-async def knowledge_chat_endpoint(message: str):
-	async with AsyncSessionLocal() as session:
-		async for event in stream_knowledge_agent(message, session):
-			yield event
-
-
 # Phase 4: the ORCHESTRATOR over SSE — the single entry point the frontend should
 # use. Same per-stream session lifetime and event contract as the specialist
 # endpoints, plus the new {"type":"route", "intent":...} event. Internally it
 # classifies the message and delegates to the right specialist, so one chat box
 # now handles account + knowledge questions (and stubs action until Phase 5).
+# The DB session is opened HERE with `async with` (not Depends) so its lifetime
+# provably spans the whole stream: it opens before the first event and closes
+# only when the generator is exhausted — no reliance on framework teardown timing
+# for streamed bodies. We pass the live session into the agent so the agent itself
+# stays decoupled/testable.
 @app.get("/api/orchestrator/chat", response_class=EventSourceResponse)
 async def orchestrator_chat_endpoint(message: str):
 	async with AsyncSessionLocal() as session:
