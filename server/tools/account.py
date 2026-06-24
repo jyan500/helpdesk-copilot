@@ -56,7 +56,10 @@ class OrderInfo(BaseModel):
     status: str
     item: str
     total_amount: Decimal
-    created_at: datetime
+    # The field NAME is part of what the model reads. "created_at" is ambiguous
+    # (created when?); "order_date" tells the model this is the purchase date the
+    # refund policy's 30-day window is measured from. (DB column stays created_at.)
+    order_date: datetime
 
 
 class SubscriptionInfo(BaseModel):
@@ -113,9 +116,9 @@ async def get_orders(session: AsyncSession, customer_id: int) -> dict:
         shaped.append(OrderInfo(
             id=order.id, 
             status=order.status, 
-            item=order.item, 
-            total_amount=order.total_amount, 
-            created_at=order.created_at
+            item=order.item,
+            total_amount=order.total_amount,
+            order_date=order.created_at   # model-facing name; source column is still created_at
         ).model_dump(mode="json"))
     return {"customer_id": customer_id, "count": len(shaped), "orders": shaped}
 

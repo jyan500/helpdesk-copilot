@@ -30,9 +30,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import Article, DocChunk
 from utils.embeddings import embed_query
 
-# Default number of chunks to retrieve. Small (3) keeps the prompt focused and
-# cheap; raising it gives the model more context but also more chance to wander.
-DEFAULT_TOP_K = 3
+# Default number of chunks to retrieve. Raised 3 -> 5 in Phase 4: at 3 the refund
+# "30-day eligibility" chunk fell just below the cutoff for "is my shipped order
+# refundable?", so the agent answered without the rule and hallucinated a
+# disqualifier. More context = more chance to wander, but here it closes a real gap.
+DEFAULT_TOP_K = 5
 
 
 # ---------------------------------------------------------------------------

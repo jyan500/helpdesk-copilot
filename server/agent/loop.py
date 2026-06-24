@@ -35,7 +35,9 @@ from tools.knowledge import TOOLS as KNOWLEDGE_TOOLS
 from utils.constants import GEMINI_FLASH_LITE_MODEL
 
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
-EMPTY_RETRY_LIMIT = 2 # if the LLM client comes back with an empty response, allow for retries
+EMPTY_RETRY_LIMIT = 4 # Flash-Lite intermittently ends a turn (finish_reason=STOP) with
+                      # no content; retrying the same request usually succeeds, so allow a
+                      # few attempts before giving up.
 
 ACCOUNT_SYSTEM_PROMPT = (
     """
@@ -43,7 +45,10 @@ ACCOUNT_SYSTEM_PROMPT = (
     To answer questions about a customer, you must first call get_customer(email) to get the id,
     then call get_orders/get_subscription with that id.
     If get_customer returns found=false, say you couldn't find the customer instead of inventing data.
-    Be concise, and answer the actual question asked.
+    Be concise. Provide the customer, order, and subscription information relevant to the
+    request. If you are explicitly asked only to look up and report data (e.g. as part of a
+    larger workflow), do exactly that — report the data and don't try to answer questions
+    that are outside your scope.
     """
 )
 
@@ -59,6 +64,17 @@ KNOWLEDGE_SYSTEM_PROMPT = (
     using ONLY the information in those chunks. Do not rely on prior knowledge or
     invent details. If the retrieved chunks don't contain the answer, say you
     couldn't find it in the help center rather than guessing.
+
+    For questions about whether something QUALIFIES under a policy (e.g. refund
+    eligibility), decide ONLY from conditions the retrieved policy explicitly
+    states; do not invent or infer disqualifiers. In particular: an order's
+    fulfillment status (e.g. "shipped" or "delivered") does NOT affect refund
+    eligibility unless the policy says so, and "shipping charges are non-refundable"
+    means the shipping FEE is not refunded — it does NOT mean a shipped order can't
+    be refunded. Work through each stated condition in turn (is it within the time
+    window from the purchase date? is it final-sale? etc.) and base your verdict on
+    those. If a condition can't be determined from the information provided, say so
+    instead of assuming the worst.
 
     Cite your source: end your answer with the title of the article you used,
     e.g. (Source: Refunds & Returns). Be concise and answer the actual question.
@@ -145,11 +161,20 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
 
         function_call = None
         produced_text = False
+        finish_reason = None       # why the model ended its turn (diagnostic)
+        prompt_feedback = None     # set if the PROMPT itself was blocked (safety)
         async for chunk in stream:
-            # some chunks have no candidates
+            # prompt-level block: no candidates at all, but maybe prompt_feedback
             if not chunk.candidates:
+                if getattr(chunk, "prompt_feedback", None):
+                    prompt_feedback = chunk.prompt_feedback
                 continue
-            content = chunk.candidates[0].content
+            cand = chunk.candidates[0]
+            # finish_reason rides on a metadata-only chunk (content=None), so grab it
+            # BEFORE the parts guard below or we'd never see it.
+            if cand.finish_reason:
+                finish_reason = cand.finish_reason
+            content = cand.content
             # some chunks contain only metadata (i.e finish reason, usage, etc) but no parts
             if content is None or content.parts is None:
                 continue
@@ -186,7 +211,11 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
 
         empty_retries += 1
         if empty_retries <= EMPTY_RETRY_LIMIT:
-            print(f"{agent.name} [iter {i}] empty turn - retrying ({empty_retries})")
+            print(
+                f"{agent.name} [iter {i}] empty turn "
+                f"(finish_reason={finish_reason}, prompt_feedback={prompt_feedback}) "
+                f"- retrying ({empty_retries})"
+            )
             continue
         yield {"type": "delta", "text": "Sorry, I couldn't generate a response. Please try again."}
         yield {"type": "done"}

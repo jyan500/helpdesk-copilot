@@ -22,6 +22,7 @@ watch retrieval quality change. Big chunks = more context but blurrier vectors;
 tiny chunks = sharp vectors but answers can lose surrounding context.
 """
 import asyncio
+import re
 from pathlib import Path
 
 from sqlalchemy import delete, select
@@ -34,8 +35,9 @@ from utils.embeddings import embed_texts
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
 # ---- the quality knobs. Measured in WORDS here (simplest to reason about). ----
-CHUNK_SIZE = 80      # words per chunk
-CHUNK_OVERLAP = 20   # words shared between consecutive chunks (keeps sentences whole)
+CHUNK_SIZE = 80      # words per chunk (used by the word-window FALLBACK below)
+CHUNK_OVERLAP = 20   # words shared between consecutive word-window chunks
+MAX_CHUNK_WORDS = 120  # a paragraph longer than this gets sub-split by the word window
 
 
 def load_articles() -> list[tuple[str, str, str]]:
@@ -56,28 +58,14 @@ def load_articles() -> list[tuple[str, str, str]]:
     return articles
 
 
-def chunk_text(body: str) -> list[str]:
-    """Split one article body into overlapping chunks of ~CHUNK_SIZE words.
+def _chunk_words(text: str) -> list[str]:
+    """Sliding word-window splitter — your Phase 3 chunker, kept as a HELPER.
 
-    A sliding window: take CHUNK_SIZE words, then step forward by
-    (CHUNK_SIZE - CHUNK_OVERLAP) words so each chunk re-includes the tail of the
-    previous one. The overlap is what stops a sentence that straddles a boundary
-    from being cut in half and losing its meaning.
-
-    Pointers:
-      - words = body.split()                       # whitespace tokenize
-      - step = CHUNK_SIZE - CHUNK_OVERLAP           # how far the window advances
-      - loop i = 0, step, 2*step, ...  while i < len(words):
-            chunk_words = words[i : i + CHUNK_SIZE]
-            chunks.append(" ".join(chunk_words))
-      - stop once the window reaches the end (the last chunk may be shorter).
-      - guard: if step <= 0 you'd loop forever — CHUNK_OVERLAP must be < CHUNK_SIZE.
-
-    (This is deliberately naive — word windows, ignoring sentence/paragraph
-    boundaries. Smarter chunking is a great thing to experiment with later.)
+    It's no longer the primary strategy; chunk_text() below calls it only as a
+    FALLBACK, to sub-split a single paragraph that's too long to embed as one chunk.
+    (Same sliding window as before: CHUNK_SIZE words per step of CHUNK_SIZE-OVERLAP.)
     """
-    # TODO: implement the sliding window per the pointers above.
-    words = body.split()
+    words = text.split()
     step = CHUNK_SIZE - CHUNK_OVERLAP
     if step <= 0:
         raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
@@ -86,7 +74,47 @@ def chunk_text(body: str) -> list[str]:
     while i < len(words):
         chunk_words = words[i:i + CHUNK_SIZE]
         chunks.append(" ".join(chunk_words))
-        i = i + step 
+        i = i + step
+    return chunks
+
+
+def chunk_text(body: str) -> list[str]:
+    """Split an article body into PARAGRAPH-based chunks — SCAFFOLD, fill the TODOs.
+
+    Why switch from word windows to paragraphs: in refunds-and-returns.md the
+    "30-day window" sentence and the eligibility CONDITIONS sit in the same
+    paragraph, but the fixed 80-word window scattered them into different chunks
+    (and cut mid-sentence). Markdown separates paragraphs with a blank line, so each
+    paragraph is already a self-contained idea — a much better unit to embed and
+    retrieve whole.
+
+    Pointers:
+      1. SPLIT on blank lines into paragraphs, then strip() each and DROP empties.
+         (Regex for "one or more blank lines" is in the TODO below.)
+      2. For each paragraph, pick granularity by length:
+           - short enough (<= MAX_CHUNK_WORDS words) -> keep it as ONE chunk
+               chunks.append(para)
+           - longer -> sub-split it so no chunk is huge, reusing the helper:
+               chunks.extend(_chunk_words(para))
+      3. Return the chunks in document order.
+
+    EXPERIMENT (the Phase 3 checkpoint in practice): tweak MAX_CHUNK_WORDS, re-run
+    `python -m db.ingest`, then re-ask the refund-eligibility question and watch
+    which chunks come back.
+    """
+    # TODO: implement paragraph splitting per the pointers above.
+    #   - paras = re.split(r"\n\s*\n", body)   # break on one-or-more blank lines
+    #   - normalize: para = para.strip(); skip if empty
+    #   - length test: len(para.split()) <= MAX_CHUNK_WORDS  -> one chunk; else _chunk_words(para)
+    chunks = []
+    paragraphs = re.split(r"\n\s*\n", body) # break on one or more blank lines
+    for paragraph in paragraphs:
+        if paragraph.strip() != "":
+            if len(paragraph.split()) <= MAX_CHUNK_WORDS:
+                chunks.append(paragraph.strip())
+            else:
+                # needs to be sub-split so no singular chunk is too big
+                chunks.extend(_chunk_words(paragraph.strip()))
     return chunks
 
 async def ingest() -> None:
