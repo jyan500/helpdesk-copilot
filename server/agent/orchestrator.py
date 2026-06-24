@@ -37,11 +37,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.agents import AGENTS
 from agent.loop import AgentConfig, stream_agent
-from utils.constants import GEMINI_FLASH_LITE_MODEL, GEMINI_3_FLASH_LITE_MODEL
-
+from utils.constants import USE_MODEL
 # The labels classify() is allowed to produce. "account" and "knowledge" must
 # match keys in AGENTS; "action" is recognized now but not yet served (Phase 5).
-USE_MODEL = GEMINI_3_FLASH_LITE_MODEL
 INTENTS = ("account", "knowledge", "action")
 DEFAULT_INTENT = "knowledge"  # safe fallback if the model returns something off-list
 

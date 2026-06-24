@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import ARRAY, Float, ForeignKey, Numeric, String, Text, DateTime, func
+from sqlalchemy import ARRAY, JSON, Float, ForeignKey, Numeric, String, Text, DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -150,3 +150,91 @@ class DocChunk(Base):
     embedding: Mapped[list[float]] = mapped_column(ARRAY(Float))
 
     article: Mapped["Article"] = relationship(back_populates="chunks")
+
+
+# ===========================================================================
+# Phase 5 — Action agent + human-in-the-loop.
+#
+# Two new tables, and they sit at opposite ends of the "does this action need a
+# gate?" spectrum that's the whole Phase 5 lesson:
+#
+#   Ticket          a row the ACTION agent CREATES (create_ticket). Opening a
+#                   ticket is reversible/low-stakes, so it runs immediately — no
+#                   approval. This is just "a write tool that inserts a row".
+#
+#   PendingAction   the hard part. When the agent wants to do something
+#                   IRREVERSIBLE (issue a refund, send an email), we DON'T run the
+#                   tool. We freeze the agent's state into THIS row, end the
+#                   stream, and show the user an Approve/Deny prompt. On Approve we
+#                   reload the row, run the tool, and resume the loop. This table
+#                   IS the answer to the phase checkpoint, "how do you represent
+#                   and resume a paused agent?" — the paused agent is just a row.
+# ===========================================================================
+class Ticket(Base):
+    """A support ticket the action agent opens. Mirror the Order/Subscription style."""
+    __tablename__ = "tickets"
+
+    # TODO: fill in the columns. Suggested shape (lean — only what create_ticket needs):
+    #   id: Mapped[int]            -> mapped_column(primary_key=True)
+    #   customer_email: Mapped[str | None] -> mapped_column(String(255), nullable=True)
+    #         (the agent may open a ticket without a known customer)
+    #   subject: Mapped[str]       -> mapped_column(String(200))
+    #   body: Mapped[str]          -> mapped_column(Text)
+    #   status: Mapped[str]        -> mapped_column(String(32), server_default="open")
+    #   created_at: Mapped[datetime] -> mapped_column(DateTime(timezone=True),
+    #                                                  server_default=func.now())
+    # (No relationship needed — a ticket is standalone for this learning slice.)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    subject: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), server_default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PendingAction(Base):
+    """A paused agent, persisted. One row = one action awaiting human approval.
+
+    The serialized agent lives in `contents`: the full genai conversation history
+    (user turn, any tool lookups, and the model turn that REQUESTED the gated tool)
+    as JSON. To resume, agent/loop.py deserializes it, appends the tool's result
+    (Approve) or a "declined" note (Deny), and re-enters the same loop. Storing it
+    in Postgres — not memory — is what lets the pause survive a server restart and
+    makes "resuming a paused agent" a concrete, inspectable thing.
+    """
+    __tablename__ = "pending_actions"
+
+    # TODO: fill in the columns. Pointers:
+    #   id: Mapped[str]   -> mapped_column(String(32), primary_key=True)
+    #       NOTE: NOT autoincrement. We generate this app-side (uuid4().hex) so the
+    #       value exists before commit and can be handed to the UI as `pending_id`
+    #       to round-trip on the resume request. (agent/pending.py, subpart 3, mints it.)
+    #
+    #   agent_name: Mapped[str] -> mapped_column(String(32))
+    #       Which specialist to resume — a key into AGENTS (e.g. "action"). On resume
+    #       we look the AgentConfig back up by this name instead of re-classifying.
+    #
+    #   tool_name: Mapped[str]  -> mapped_column(String(64))
+    #   tool_args: Mapped[dict] -> mapped_column(JSON)
+    #       The exact call the user is approving — kept alongside `contents` so the
+    #       resume step can run it directly (await agent.tools[tool_name](**tool_args))
+    #       without re-parsing it out of the history.
+    #
+    #   contents: Mapped[list] -> mapped_column(JSON)
+    #       The serialized conversation history (list of genai Content dicts). This
+    #       is the "frozen agent". Watch out: the Gemini-3 thought_signature on the
+    #       function-call part MUST survive serialization or the resumed call 400s
+    #       (same gotcha agent/loop.py already handles when echoing the model turn).
+    #
+    #   status: Mapped[str] -> mapped_column(String(16), server_default="pending")
+    #       pending | approved | denied — the action's lifecycle.
+    #
+    #   created_at: Mapped[datetime] -> mapped_column(DateTime(timezone=True),
+    #                                                  server_default=func.now())
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    agent_name: Mapped[str] = mapped_column(String(32))
+    tool_name: Mapped[str] = mapped_column(String(64))
+    tool_args: Mapped[dict] = mapped_column(JSON)
+    contents: Mapped[list] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

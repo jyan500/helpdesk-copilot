@@ -32,9 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tools.account import ACCOUNT_TOOL_DECLS, TOOLS
 from tools.knowledge import KNOWLEDGE_TOOL_DECLS
 from tools.knowledge import TOOLS as KNOWLEDGE_TOOLS
-from utils.constants import GEMINI_FLASH_LITE_MODEL, GEMINI_3_FLASH_LITE_MODEL
+from utils.constants import USE_MODEL
 
-USE_MODEL = GEMINI_3_FLASH_LITE_MODEL
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
 EMPTY_RETRY_LIMIT = 4 # Flash-Lite intermittently ends a turn (finish_reason=STOP) with
                       # no content; retrying the same request usually succeeds, so allow a
@@ -168,6 +167,8 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
         produced_text = False
         finish_reason = None       # why the model ended its turn (diagnostic)
         prompt_feedback = None     # set if the PROMPT itself was blocked (safety)
+        thought_signature = None   # Gemini 3: opaque token that MUST be echoed back
+                                   # with the function call or the API 400s
         async for chunk in stream:
             # prompt-level block: no candidates at all, but maybe prompt_feedback
             if not chunk.candidates:
@@ -186,6 +187,9 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
             for part in content.parts:
                 if part.function_call:
                     function_call = part.function_call
+                    # Gemini 3 rides a thought_signature on the function-call part;
+                    # keep it so we can send it back on the model turn below.
+                    thought_signature = part.thought_signature
                 elif part.text:
                     produced_text = True
                     yield {"type": "delta", "text": part.text}
@@ -198,7 +202,10 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
 
             contents.append(types.Content(
                 role="model",
-                parts=[types.Part(function_call=function_call)]
+                parts=[types.Part(
+                    function_call=function_call,
+                    thought_signature=thought_signature,  # Gemini 3 requires this echoed back
+                )]
             ))
             contents.append(types.Content(
                 role="user",
