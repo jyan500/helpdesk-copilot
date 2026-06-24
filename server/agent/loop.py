@@ -32,8 +32,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tools.account import ACCOUNT_TOOL_DECLS, TOOLS
 from tools.knowledge import KNOWLEDGE_TOOL_DECLS
 from tools.knowledge import TOOLS as KNOWLEDGE_TOOLS
-from utils.constants import GEMINI_FLASH_LITE_MODEL
+from utils.constants import GEMINI_FLASH_LITE_MODEL, GEMINI_3_FLASH_LITE_MODEL
 
+USE_MODEL = GEMINI_3_FLASH_LITE_MODEL
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
 EMPTY_RETRY_LIMIT = 4 # Flash-Lite intermittently ends a turn (finish_reason=STOP) with
                       # no content; retrying the same request usually succeeds, so allow a
@@ -161,7 +162,7 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
     empty_retries = 0
     for i in range(MAX_ITERS):
         stream = await client.aio.models.generate_content_stream(
-        model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config)
+        model=USE_MODEL, contents=contents, config=config)
 
         function_call = None
         produced_text = False
@@ -253,7 +254,7 @@ async def run_account_agent(message: str, session: AsyncSession) -> str:
     empty_retries = 0
     for i in range(MAX_ITERS):
         response = await client.aio.models.generate_content(
-            model=GEMINI_FLASH_LITE_MODEL, contents=contents, config=config
+            model=USE_MODEL, contents=contents, config=config
         )
 
         model_turn = response.candidates[0].content

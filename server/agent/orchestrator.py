@@ -37,10 +37,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.agents import AGENTS
 from agent.loop import AgentConfig, stream_agent
-from utils.constants import GEMINI_FLASH_LITE_MODEL
+from utils.constants import GEMINI_FLASH_LITE_MODEL, GEMINI_3_FLASH_LITE_MODEL
 
 # The labels classify() is allowed to produce. "account" and "knowledge" must
 # match keys in AGENTS; "action" is recognized now but not yet served (Phase 5).
+USE_MODEL = GEMINI_3_FLASH_LITE_MODEL
 INTENTS = ("account", "knowledge", "action")
 DEFAULT_INTENT = "knowledge"  # safe fallback if the model returns something off-list
 
@@ -60,61 +61,6 @@ CLASSIFIER_SYSTEM_PROMPT = (
     Output only the single word. Do not explain.
     """
 )
-
-
-async def classify(message: str) -> str:
-    """Return one of INTENTS for `message`. A cheap, tool-less classification call.
-
-    Pointers:
-      - Build a genai.Client() and a GenerateContentConfig with:
-          system_instruction=CLASSIFIER_SYSTEM_PROMPT,
-          max_output_tokens=...        # tiny — it's one word (e.g. 5)
-          thinking_config=types.ThinkingConfig(thinking_budget=0),
-          # NO tools here — classification doesn't call functions.
-      - One non-streaming call is fine (it's short):
-          resp = await client.aio.models.generate_content(
-              model=GEMINI_FLASH_LITE_MODEL,
-              contents=[types.Content(role="user", parts=[types.Part(text=message)])],
-              config=config)
-      - Pull the text out (resp.text, or join the parts), then NORMALIZE it:
-          label = (resp.text or "").strip().lower()
-        The model may add stray whitespace/quotes/a period — be defensive.
-      - VALIDATE against INTENTS. If the label isn't one of them, fall back to
-        DEFAULT_INTENT instead of trusting a bad label. (Tip: `if "account" in
-        label ... elif "action" in label ...` is a forgiving way to map a slightly
-        chatty reply onto a clean intent.)
-      - print(f"[orchestrator] classified -> {label}") so you can watch routing.
-    """
-    # TODO: implement per the pointers above.
-    client = genai.Client()
-
-    config = types.GenerateContentConfig(
-        max_output_tokens=10,
-        system_instruction=CLASSIFIER_SYSTEM_PROMPT,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
-    )
-
-    resp = await client.aio.models.generate_content(
-        model=GEMINI_FLASH_LITE_MODEL,
-        contents=[types.Content(role="user", parts=[types.Part(text=message)])],
-        config=config
-    )
-
-    label = (resp.text or "").strip().lower()
-    intent = DEFAULT_INTENT 
-    # we do substring checing in case the returned string from the LLM contains more than just the label
-    # i.e if the LLM returns the string "this is an account classification", 
-    # we check for the substring "account"
-    if "account" in label:
-        intent = "account"
-    elif "knowledge" in label:
-        intent = "knowledge"
-    elif "action" in label:
-        intent = "action"
-
-    print(f"[orchestrator] classified -> {label}")
-    return intent
-
 
 # ===========================================================================
 # PHASE 4 STRETCH — sequential multi-agent ("passes context between agents").
@@ -187,7 +133,7 @@ async def plan(message: str) -> list[str]:
     )
 
     resp = await client.aio.models.generate_content(
-        model=GEMINI_FLASH_LITE_MODEL,
+        model=USE_MODEL,
         contents=[types.Content(role="user", parts=[types.Part(text=message)])],
         config=config
     )
@@ -262,27 +208,6 @@ async def stream_orchestrator(message: str, session: AsyncSession):
         return
 
     # SEQUENTIAL PIPELINE (NEW) — two or more specialists, in order.
-    #
-    # TODO: implement per the pointers below.
-    #   context = ""
-    #   for step in steps[:-1]:                       # every agent EXCEPT the last
-    #       # let the UI show which specialist we're consulting (reuse the tool event,
-    #       # so no frontend change needed):
-    #       yield {"type": "tool", "name": f"{step} agent", "args": {}}
-    #       # give this agent the original question PLUS what we've learned so far:
-    #       step_input = message if not context else f"{message}\n{context}"
-    #       answer = await collect_agent_text(AGENTS[step], step_input, session)
-    #       context += f"\n[{step} agent found]:\n{answer}\n"
-    #
-    #   # FINAL step streams to the user, with all gathered context folded in:
-    #   last = steps[-1]
-    #   final_input = (
-    #       f"{message}\n\n"
-    #       f"Context gathered from other specialists:\n{context}"
-    #   )
-    #   async for event in stream_agent(AGENTS[last], final_input, session):
-    #       yield event
-    #
     # NOTE: the final agent is a specialist with a narrow prompt (e.g. the knowledge
     # agent says "answer ONLY from retrieved chunks"). The order facts you pass in
     # `context` live in the USER message, not the chunks — if the agent ignores them,
@@ -294,16 +219,6 @@ async def stream_orchestrator(message: str, session: AsyncSession):
     for step in steps[:-1]:
         # let the UI show which specialist we're consulting (reuse the tool event)
         yield {"type": "tool", "name": f"{step} agent", "args": {}}
-        # The account agent stalled here because it was handed the RAW end question
-        # ("is this refundable?") — out of its lane, so after get_customer it didn't
-        # know to fetch orders and emitted empty turns. Lesson: an upstream step
-        # should get a FOCUSED data-gathering task, not the user's end question.
-        #
-        # TODO: replace step_input with a gather-and-report instruction that tells
-        #   the agent to: look up and REPORT the concrete details relevant to the
-        #   request (dates, amounts, statuses, ids) and to NOT answer the question,
-        #   refuse, or ask follow-ups. Still include the request + prior context:
-        #       f"<gather-and-report instruction>\n\nUser request: {message}\n{context}"
         # Always brief the step with the gather-and-report instruction; only the
         # CONTEXT is conditional (empty on the first step, filled on later ones).
         step_input = f"{GATHER_AND_REPORT_PROMPT}\n\nUser request: {message}"
