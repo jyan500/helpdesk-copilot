@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.sse import EventSourceResponse
 
+from agent.loop import resume_agent
 from agent.orchestrator import stream_orchestrator
 from db.session import AsyncSessionLocal
 from utils.client import LLMClient
@@ -49,4 +50,18 @@ async def chat_endpoint(message: str):
 async def orchestrator_chat_endpoint(message: str):
 	async with AsyncSessionLocal() as session:
 		async for event in stream_orchestrator(message, session):
+			yield event
+
+
+# Phase 5: RESUME a paused action. When the action agent hits an approval-gated tool
+# it ends the /chat stream with an {"type":"approval", pending_id, ...} event; the UI
+# shows Approve/Deny and then calls THIS endpoint with that pending_id + the decision.
+# We don't re-classify or re-run the orchestrator — resume_agent loads the saved
+# PendingAction by id, so it already knows which agent and which tool to finish.
+# Same per-stream `async with` session lifetime as the chat endpoints above.
+# `decision` is "approve" or "deny" (resume_agent treats anything != "approve" as deny).
+@app.get("/api/orchestrator/resume", response_class=EventSourceResponse)
+async def orchestrator_resume_endpoint(pending_id: str, decision: str):
+	async with AsyncSessionLocal() as session:
+		async for event in resume_agent(pending_id, decision, session):
 			yield event

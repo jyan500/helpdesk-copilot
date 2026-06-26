@@ -29,10 +29,19 @@ from google import genai
 from google.genai import types
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.pending import (
+    create_pending_action,
+    deserialize_contents,
+    load_pending_action,
+    mark_pending_action,
+)
 from tools.account import ACCOUNT_TOOL_DECLS, TOOLS
+from tools.action import describe_action
 from tools.knowledge import KNOWLEDGE_TOOL_DECLS
 from tools.knowledge import TOOLS as KNOWLEDGE_TOOLS
 from utils.constants import USE_MODEL
+# NOTE: AGENTS (agent/agents.py) is imported LAZILY inside resume_agent, not here —
+# agents.py imports FROM this module, so a top-level import would be circular.
 
 MAX_ITERS = 6  # cost guardrail: never loop forever (CLAUDE.md cost rule)
 EMPTY_RETRY_LIMIT = 4 # Flash-Lite intermittently ends a turn (finish_reason=STOP) with
@@ -85,6 +94,32 @@ KNOWLEDGE_SYSTEM_PROMPT = (
     """
 )
 
+# Phase 5 — the ACTION agent. Unlike the read-only specialists, it can change the
+# world (refund, ticket, email), so its prompt is about doing the RIGHT action with
+# the RIGHT id, not about answering questions. Approval is enforced by the loop
+# (requires_approval), NOT by the prompt — so this only needs to tell the model how
+# to gather ids and what to say afterward. Tune it freely; prompt-tuning is the lesson.
+ACTION_SYSTEM_PROMPT = (
+    """
+    You are a helpdesk action agent. You DO things on the user's behalf: issue
+    refunds, open support tickets, and send emails.
+
+    Many actions need a concrete id the user didn't give you. Resolve it FIRST with
+    the lookup tools: call get_customer(email) to get the customer id, then
+    get_orders(customer_id) to find the specific order. NEVER invent an order id,
+    customer id, or email — if you can't determine the exact target from the data,
+    say what's missing instead of guessing.
+
+    Once you have the concrete arguments, call the single action tool that does what
+    the user asked (issue_refund, create_ticket, or send_email). Do exactly what was
+    requested — one action — and don't take extra actions you weren't asked for.
+
+    After a tool returns, report the outcome plainly: confirm what was done (include
+    the refund/ticket id) on success, or explain what went wrong (e.g. the order was
+    already refunded or couldn't be found). Be concise.
+    """
+)
+
 
 # ===========================================================================
 # PHASE 4 — STEP 1: AgentConfig — a specialist agent described as DATA.
@@ -105,11 +140,15 @@ KNOWLEDGE_SYSTEM_PROMPT = (
 # ===========================================================================
 @dataclass(frozen=True)
 class AgentConfig:
-    # TODO: add the four fields described above.
     name: str
     system_prompt: str
     tool_decls: list[types.FunctionDeclaration]
     tools: dict[str, Callable[..., Awaitable[dict]]]
+    # PHASE 5: the names of this agent's tools that are IRREVERSIBLE and must pause
+    # for human approval before they run (e.g. action's issue_refund/send_email).
+    # Defaults to empty, so the account/knowledge agents are completely unchanged —
+    # only the action agent will pass a non-empty set (= tools.action.REQUIRES_APPROVAL).
+    requires_approval: frozenset[str] = frozenset()
 
 
 # ===========================================================================
@@ -129,21 +168,37 @@ class AgentConfig:
 #     {"type": "done"}
 # ===========================================================================
 async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
-    """Async generator: drives `agent`'s tool-calling loop, yielding SSE events."""
-    # TODO: build the genai client + GenerateContentConfig, but read prompt/decls
-    #   from `agent` instead of hard-coding them.
-    #
-    # TODO: run the same for-loop over MAX_ITERS you already wrote in
-    #   stream_account_agent: open the stream, consume chunks (yield deltas as
-    #   they arrive), and on a function_call -> yield a {"type":"tool",...} event,
-    #   dispatch via agent.tools[...], append the model turn + function response,
-    #   then continue. On a text-only turn yield {"type":"done"} and return.
-    #
-    # TODO: keep the empty-retry guard and the post-loop iteration-cap fallback.
-    #
-    # TIP while testing: print(f"[{agent.name} iter {i}] ...") so the logs tell you
-    #   WHICH agent ran — handy once the orchestrator is picking for you.
-    """Async generator: yields {type: tool|delta|done} events (see contract above)."""
+    """Async generator: drive `agent`'s loop from a fresh user message.
+
+    Thin wrapper since Phase 5: seed the conversation with the user's message, then
+    hand off to _drive (the shared loop). The loop was split out of here so that
+    resume_agent can re-enter the SAME loop from a SAVED conversation after an
+    approval pause — see _drive and resume_agent below.
+
+    Event contract (unchanged for the UI, plus the new "approval" event from _drive):
+        {"type": "approval", "pending_id": str, "name": str, "args": dict, "summary": str}
+        {"type": "tool",  "name": str, "args": dict}
+        {"type": "delta", "text": str}
+        {"type": "done"}
+    """
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=message)]),
+    ]
+    async for event in _drive(agent, contents, session):
+        yield event
+
+
+# ===========================================================================
+# PHASE 5 — _drive: the shared tool-calling loop, started from an EXISTING
+# `contents` history rather than building it. Two callers:
+#   stream_agent  -> seeds contents with the user message (a fresh run).
+#   resume_agent  -> rebuilds contents from a saved PendingAction + the approve/deny
+#                    outcome (a continuation after a pause).
+# Body is the Phase 4 loop verbatim, with ONE new branch: an approval-gated tool
+# PAUSES (persist + yield "approval" + return) instead of executing.
+# ===========================================================================
+async def _drive(agent: AgentConfig, contents: list[types.Content], session: AsyncSession):
+    """Run the tool-calling loop over `contents`, yielding SSE events."""
     client = genai.Client()
 
     config = types.GenerateContentConfig(
@@ -153,10 +208,6 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
         system_instruction=agent.system_prompt,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
-
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=message)]),
-    ]
 
     empty_retries = 0
     for i in range(MAX_ITERS):
@@ -194,19 +245,56 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
                     produced_text = True
                     yield {"type": "delta", "text": part.text}
 
-        # there IS a tool call => tell the UI, then run it (async + session):
+        # there IS a tool call.
         if function_call is not None:
+            # The model turn that REQUESTED the tool. BOTH the pause path and the
+            # execute path need this appended to `contents`, with thought_signature
+            # echoed back (Gemini 3 requires it).
+            model_turn = types.Content(
+                role="model",
+                parts=[types.Part(
+                    function_call=function_call,
+                    thought_signature=thought_signature,
+                )],
+            )
+
+            # PHASE 5 GATE (SCAFFOLD — fill in the TODO): an approval-gated tool must
+            # NOT run here. Freeze the agent and hand the decision to the user.
+            if function_call.name in agent.requires_approval:
+                # TODO: implement the pause. Pointers:
+                #   contents.append(model_turn)   # saved history must include the request
+                #   pending_id = await create_pending_action(
+                #       session, agent.name, function_call, contents)
+                #   yield {
+                #       "type": "approval",
+                #       "pending_id": pending_id,
+                #       "name": function_call.name,
+                #       "args": dict(function_call.args),
+                #       "summary": describe_action(
+                #           function_call.name, dict(function_call.args)),
+                #   }
+                #   return     # suspend: stream ends; resume_agent continues later
+                contents.append(model_turn) # include saved history
+                pending_id = await create_pending_action(
+                    session, agent.name, function_call, contents
+                )
+                yield {
+                    "type": "approval",
+                    "pending_id": pending_id,
+                    "name": function_call.name,
+                    "args": dict(function_call.args),
+                    "summary": describe_action(
+                        function_call.name, dict(function_call.args)
+                    )
+                }
+                return
+
+            # UNGATED path (Phase 4, unchanged): announce -> execute -> feed back.
             yield {"type": "tool", "name": function_call.name, "args": dict(function_call.args)}
             result = await agent.tools[function_call.name](session, **function_call.args)
             print(f"{agent.name} [iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
 
-            contents.append(types.Content(
-                role="model",
-                parts=[types.Part(
-                    function_call=function_call,
-                    thought_signature=thought_signature,  # Gemini 3 requires this echoed back
-                )]
-            ))
+            contents.append(model_turn)
             contents.append(types.Content(
                 role="user",
                 parts=[
@@ -235,6 +323,83 @@ async def stream_agent(agent: AgentConfig, message: str, session: AsyncSession):
 
     yield {"type": "delta", "text": "Sorry — I couldn't complete that within the step limit."}
     yield {"type": "done"}
+
+
+# ===========================================================================
+# PHASE 5 — resume_agent: continue a PAUSED agent after the user decides.
+#
+# The other half of the gate. _drive suspended by saving a PendingAction and ending
+# the stream. The /resume endpoint (subpart 7) calls this with the pending_id and
+# the user's decision. We rebuild the EXACT conversation, append the tool's result
+# (approve) or a "declined" note (deny) as the function_response the loop was waiting
+# for, and re-enter the SAME _drive loop so the model narrates the outcome.
+#
+# This is the phase checkpoint made concrete: a "paused agent" is just a saved
+# `contents` history + a pending tool call; resuming is "append the missing
+# function_response and keep looping."
+# ===========================================================================
+async def resume_agent(pending_id: str, decision: str, session: AsyncSession):
+    """Async generator: finish a gated action the user Approved or Denied.
+
+    Pointers:
+      - Lazy import to dodge the circular dependency (agents.py imports THIS module):
+            from agent.agents import AGENTS
+      - Load + thaw the paused agent:
+            row = await load_pending_action(session, pending_id)
+            if row is None:                      # unknown / already-handled id
+                yield {"type": "delta", "text": "That approval request was not found."}
+                yield {"type": "done"}
+                return
+            agent = AGENTS[row.agent_name]
+            contents = deserialize_contents(row.contents)   # includes the model turn w/ the call
+      - Decide and produce the tool result:
+            approved = decision == "approve"
+            if approved:
+                result = await agent.tools[row.tool_name](session, **row.tool_args)
+            else:
+                result = {"status": "denied",
+                          "message": "The user declined this action; it was not performed."}
+            await mark_pending_action(session, pending_id, "approved" if approved else "denied")
+      - Feed that result back as the function_response the loop was waiting on, then
+        re-enter the loop so the model can speak:
+            contents.append(types.Content(
+                role="user",
+                parts=[types.Part.from_function_response(
+                    name=row.tool_name, response={"result": result})],
+            ))
+            async for event in _drive(agent, contents, session):
+                yield event
+      - (Optional Phase 6 hardening: if row.status != "pending", refuse to re-run —
+        guards a double-approve. Skip for now.)
+    """
+    # TODO: implement per the pointers above.
+    from agent.agents import AGENTS
+    row = await load_pending_action(session, pending_id)
+    # unknown/already handled
+    if row is None:
+        yield {"type": "delta", "text": "Approval request was not found"}
+        yield {"type": "done"}
+        return
+    agent = AGENTS[row.agent_name]
+    contents = deserialize_contents(row.contents) # includes the model turn w/ any call
+    approved = decision == "approve"
+    if approved:
+        # get the pending tool call based on the tool name
+        result = await agent.tools[row.tool_name](session, **row.tool_args)
+    else:
+        result = {
+            "status": "denied",
+            "message": "The user declined this action; it was not performed."
+        }
+    await mark_pending_action(session, pending_id, "approved" if approved else "denied")
+    contents.append(types.Content(
+        role="user",
+        parts=[types.Part.from_function_response(
+            name=row.tool_name, response={"result": result}
+        )]
+    ))
+    async for event in _drive(agent, contents, session):
+        yield event
 
 
 # ===========================================================================
@@ -298,21 +463,16 @@ if __name__ == "__main__":
     import asyncio
 
     from db.session import AsyncSessionLocal, engine
+    from agent.agents import ACTION_AGENT
 
     async def _smoke():
-        ACCOUNT_AGENT = AgentConfig(
-            name="account",
-            system_prompt=ACCOUNT_SYSTEM_PROMPT,
-            tool_decls=ACCOUNT_TOOL_DECLS,
-            tools=ACCOUNT_TOOLS,
-        )
         async with AsyncSessionLocal() as session:
             # Once stream_agent + agent/agents.py are filled in, switch this to:
             #   from agent.agents import AGENTS
             #   async for event in stream_agent(AGENTS["account"], "...", session):
             async for event in stream_agent(
-                ACCOUNT_AGENT,
-                "what is the latest subscription for alice@example.com?",
+                ACTION_AGENT,
+                "Please refund alice@example.com's latest order",
                 session
             ):
                 print("EVENT: ", event)

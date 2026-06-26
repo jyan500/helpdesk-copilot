@@ -14,8 +14,9 @@ Two pieces to build:
   1. classify(message) -> one of INTENTS. A tiny LLM call: no tools, a tight
      system prompt, a hard cap on output tokens. It returns a LABEL, nothing else.
   2. stream_orchestrator(message, session) -> the generator the endpoint streams.
-     It classifies, tells the UI where it routed (a new "route" event), then either
-     delegates to a specialist or — for "action" — says that's coming in Phase 5.
+     It classifies, tells the UI where it routed (a new "route" event), then
+     delegates to the chosen specialist (account, knowledge, or — since Phase 5 —
+     action, which may emit an "approval" event the UI gates on).
 
 Cost note (CLAUDE.md): classify() adds one LLM call per request, so keep it cheap —
 max_output_tokens tiny, thinking off. It's classifying, not writing prose.
@@ -38,8 +39,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.agents import AGENTS
 from agent.loop import AgentConfig, stream_agent
 from utils.constants import USE_MODEL
-# The labels classify() is allowed to produce. "account" and "knowledge" must
-# match keys in AGENTS; "action" is recognized now but not yet served (Phase 5).
+# The labels classify() is allowed to produce. All three now map to keys in AGENTS
+# ("action" is served as of Phase 5).
 INTENTS = ("account", "knowledge", "action")
 DEFAULT_INTENT = "knowledge"  # safe fallback if the model returns something off-list
 
@@ -85,7 +86,7 @@ PLANNER_SYSTEM_PROMPT = (
         in run order:  account, knowledge
         (Example: "Is my latest order eligible for a refund?" -> account, knowledge —
         you must look up the order before checking the refund policy.)
-      - "action" must appear ALONE (the action agent isn't built yet).
+      - "action" must appear ALONE (the action agent does its own data lookups).
       - Output ONLY the list, e.g.  account   or   account, knowledge
     """
 )
@@ -139,7 +140,9 @@ async def plan(message: str) -> list[str]:
     raw = (resp.text or "").strip().lower()
     parsed = [s.strip() for s in raw.split(",")]
     steps = [s for s in parsed if s in INTENTS]
-    # TODO: wait until phase 5 action agent is completed
+    # The action agent is self-sufficient (it has the read tools too), so it runs
+    # ALONE — never as a step in a sequential pipeline. If the planner names it at
+    # all, collapse the plan to just the action.
     if "action" in steps:
         return ["action"]
     if not steps:
@@ -192,11 +195,10 @@ async def stream_orchestrator(message: str, session: AsyncSession):
     # The route event now describes the whole plan, e.g. "account -> knowledge".
     yield {"type": "route", "intent": " -> ".join(steps)}
 
-    # action: still a Phase 5 stub (plan() guarantees it arrives alone).
-    if steps == ["action"]:
-        yield {"type": "delta", "text": "Sorry, we cannot process this action right now."}
-        yield {"type": "done"}
-        return
+    # Phase 5: "action" is no longer stubbed. plan() guarantees it arrives ALONE, so
+    # it falls through to the FAST PATH below -> stream_agent(ACTION_AGENT, ...). Any
+    # approval event the action agent emits forwards straight through to the UI, same
+    # as tool/delta/done — the orchestrator re-yields every specialist event verbatim.
 
     # FAST PATH — a single specialist: stream it directly (unchanged behavior).
     if len(steps) == 1:

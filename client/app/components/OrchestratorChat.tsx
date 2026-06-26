@@ -5,17 +5,24 @@ import { useEffect, useRef, useState } from "react";
 // Phase 4 — the ORCHESTRATOR chat. One box for everything: it hits the
 // /api/orchestrator/chat endpoint, which classifies the message and routes it to
 // the account or knowledge specialist internally. It consumes the SAME event
-// contract as AccountChat/KnowledgeChat, PLUS one new event:
-//   {type:"route", intent}      -> which specialist the orchestrator picked (NEW)
-//   {type:"tool",  name, args}  -> a tool is running
-//   {type:"delta", text}        -> a chunk of the answer (typewriter)
-//   {type:"done"}               -> stream finished
+// contract as AccountChat/KnowledgeChat, PLUS routing/approval events:
+//   {type:"route",    intent}                  -> which specialist the orchestrator picked
+//   {type:"tool",     name, args}              -> a tool is running
+//   {type:"delta",    text}                    -> a chunk of the answer (typewriter)
+//   {type:"approval", pending_id, name, args, summary}  -> NEW (Phase 5): the action
+//        agent hit an irreversible, gated tool (refund / email). The server has
+//        SAVED its paused state and ENDED this stream. The UI must show Approve/Deny
+//        and, on click, RESUME via a brand-new request to /api/orchestrator/resume.
+//   {type:"done"}                              -> stream finished
 interface AgentEvent {
-  type: "route" | "tool" | "delta" | "done";
+  type: "route" | "tool" | "delta" | "approval" | "done";
   intent?: string;
   name?: string;
   args?: Record<string, unknown>;
   text?: string;
+  // Phase 5 — only present on "approval" events:
+  pending_id?: string;
+  summary?: string;
 }
 
 interface Message {
@@ -23,7 +30,18 @@ interface Message {
   content: string;
 }
 
-type Status = "idle" | "thinking" | "streaming";
+// Phase 5 adds "awaiting-approval": the stream has paused on a gated action and we
+// are blocked on the user clicking Approve/Deny. Input stays disabled (it's already
+// !== "idle", so the existing guards cover it) until they decide.
+type Status = "idle" | "thinking" | "streaming" | "awaiting-approval";
+
+// The paused action awaiting a decision. `id` is the pending_id we echo back to
+// /resume; `summary` is the human-readable line the action tool produced.
+interface Pending {
+  id: string;
+  name?: string;
+  summary?: string;
+}
 
 export default function OrchestratorChat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -32,37 +50,25 @@ export default function OrchestratorChat() {
   const [toolActivity, setToolActivity] = useState<string | null>(null);
   // The orchestrator's routing decision, shown so you can SEE the triage step.
   const [route, setRoute] = useState<string | null>(null);
+  // Phase 5 — the action awaiting approval (null when nothing is gated).
+  const [pending, setPending] = useState<Pending | null>(null);
   const esRef = useRef<EventSource | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
-  }, [messages, toolActivity, route]);
+  }, [messages, toolActivity, route, pending]);
 
-  const onSubmit = () => {
-    const trimmed = input.trim();
-    if (!trimmed || status !== "idle") return;
-
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: trimmed },
-      { role: "assistant", content: "" },
-    ]);
-    setInput("");
-    setStatus("thinking");
-    setToolActivity(null);
-    setRoute(null);
-
-    esRef.current?.close();
-    const es = new EventSource(
-      `http://localhost:8000/api/orchestrator/chat?message=${encodeURIComponent(trimmed)}`
-    );
-    esRef.current = es;
-
+  // The SHARED event handler. Both the initial send AND the resume open an
+  // EventSource and hand it here — that's the whole trick to resuming: the
+  // narration after Approve/Deny streams through the exact same delta/done logic,
+  // landing in the same assistant bubble. Wiring it once keeps the two flows in
+  // sync (fix a bug here, both benefit).
+  const consume = (es: EventSource) => {
     es.onmessage = (e) => {
       const event: AgentEvent = JSON.parse(e.data);
 
-      // NEW: the triage decision arrives first — surface it to the user.
+      // The triage decision arrives first — surface it to the user.
       if (event.type === "route") {
         setRoute(event.intent ?? null);
       }
@@ -70,6 +76,30 @@ export default function OrchestratorChat() {
       if (event.type === "tool") {
         setStatus("thinking");
         setToolActivity(`Running ${event.name}…`);
+      }
+
+      // Phase 5 — the gate. The action agent asked for an irreversible tool; the
+      // server saved its state and ENDED this stream. Show the card and wait.
+      if (event.type === "approval") {
+        // TODO (subpart 8a): handle the approval gate. Pointers:
+        //   - stash the paused action so the card can render:
+        //       setPending({ id: event.pending_id!, name: event.name, summary: event.summary });
+        //   - enter the blocked state + clear the transient hints:
+        //       setStatus("awaiting-approval");
+        //       setToolActivity(null);
+        //   - close THIS EventSource (it's already done server-side; tidy up):
+        //       es.close();
+        //   - return early so you DON'T fall through to delta/done below.
+
+        // stash the paused action so the approval card can render
+        setPending({id: event.pending_id!, name: event.name, summary: event.summary})
+        // enter the blocked state + clear transient hints
+        setStatus("awaiting-approval")
+        setToolActivity(null)
+
+        // close the event source and return to avoid falling into the case below
+        es.close()
+        return
       }
 
       if (event.type === "delta") {
@@ -95,6 +125,67 @@ export default function OrchestratorChat() {
       setStatus("idle");
       setToolActivity(null);
     };
+  };
+
+  const onSubmit = () => {
+    const trimmed = input.trim();
+    if (!trimmed || status !== "idle") return;
+
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: trimmed },
+      { role: "assistant", content: "" },
+    ]);
+    setInput("");
+    setStatus("thinking");
+    setToolActivity(null);
+    setRoute(null);
+    setPending(null);
+
+    esRef.current?.close();
+    const es = new EventSource(
+      `http://localhost:8000/api/orchestrator/chat?message=${encodeURIComponent(trimmed)}`
+    );
+    esRef.current = es;
+    consume(es);
+  };
+
+  // Phase 5 — RESUME a paused action. Fired by the Approve/Deny buttons. This is a
+  // SECOND request (EventSource is GET-only and one-shot), to a DIFFERENT endpoint,
+  // carrying the pending_id + decision. Crucially we DON'T push a new assistant
+  // bubble: the narration streams into the SAME empty bubble the action agent left
+  // behind when it paused, so the conversation continues seamlessly.
+  const respond = (decision: "approve" | "deny") => {
+    // TODO (subpart 8b): open the resume stream. Pointers:
+    //   - guard: if (!pending) return;
+    //   - capture the id, then clear the card and re-enter a streaming-ish state:
+    //       const pendingId = pending.id;
+    //       setPending(null);
+    //       setStatus("thinking");
+    //   - open a NEW EventSource to the resume endpoint with the id + decision:
+    //       esRef.current?.close();
+    //       const es = new EventSource(
+    //         `http://localhost:8000/api/orchestrator/resume` +
+    //         `?pending_id=${encodeURIComponent(pendingId)}&decision=${decision}`
+    //       );
+    //       esRef.current = es;
+    //   - REUSE the shared handler so deltas land in the current bubble:
+    //       consume(es);
+    if (!pending){
+      return
+    }
+    const pendingId = pending.id
+    setPending(null)
+    setStatus("thinking")
+
+    // open new event source to the resume endpoint with the id + decision
+    esRef.current?.close()
+    const es = new EventSource(
+      `http://localhost:8000/api/orchestrator/resume` + 
+      `?pending_id=${encodeURIComponent(pendingId)}&decision=${decision}`
+    ) 
+    esRef.current = es
+    consume(es)
   };
 
   useEffect(() => () => esRef.current?.close(), []);
@@ -144,6 +235,32 @@ export default function OrchestratorChat() {
         )}
         {status === "thinking" && !toolActivity && (
           <div className="self-start text-xs text-gray-500 italic">Thinking…</div>
+        )}
+
+        {/* Phase 5 — the approval card. Shown only while an action is gated. */}
+        {pending && (
+          <div className="self-start max-w-[90%] border border-amber-300 bg-amber-50 rounded-lg p-3 flex flex-col gap-y-2">
+            <div className="text-[10px] uppercase tracking-wide text-amber-700">
+              Approval required
+            </div>
+            <div className="text-sm text-amber-900">
+              {pending.summary ?? `Run ${pending.name}?`}
+            </div>
+            <div className="flex flex-row gap-x-2">
+              <button
+                onClick={() => respond("approve")}
+                className="bg-green-600 text-white rounded px-3 py-1 text-xs"
+              >
+                Approve
+              </button>
+              <button
+                onClick={() => respond("deny")}
+                className="bg-red-600 text-white rounded px-3 py-1 text-xs"
+              >
+                Deny
+              </button>
+            </div>
+          </div>
         )}
       </div>
 
