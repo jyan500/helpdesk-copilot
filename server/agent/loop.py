@@ -294,6 +294,16 @@ async def _drive(agent: AgentConfig, contents: list[types.Content], session: Asy
             result = await agent.tools[function_call.name](session, **function_call.args)
             print(f"{agent.name} [iter {i}] {function_call.name}({dict(function_call.args)}) -> {result}")
 
+            # PHASE 6 (thoughts panel): surface what the tool RETURNED, not just that it
+            # ran. This is the SAME `result` we feed back to the model below — we just
+            # also forward it to the UI so the panel shows the full request -> response
+            # handshake from Phase 1 (model asks -> we run -> here's the result -> model
+            # speaks). The dict is already JSON-safe (the tools return model_dump(mode=
+            # "json")), so it round-trips over SSE as-is — no extra serialization.
+            # TODO: yield the result event (mirror the "tool" yield above):
+            #   yield {"type": "tool_result", "name": function_call.name, "result": result}
+            yield {"type": "tool_result", "name": function_call.name, "result": result}
+
             contents.append(model_turn)
             contents.append(types.Content(
                 role="user",
