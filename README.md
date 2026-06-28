@@ -4,6 +4,8 @@ An autonomous support-operations agent: one chat box that answers questions abou
 customer's account, answers policy/how-to questions from a help center (RAG), and
 takes sandboxed actions (refunds, tickets, emails) behind a human-approval gate.
 
+https://github.com/user-attachments/assets/edc316f6-ef1d-4c6f-b3bc-680c9d69ef1e
+
 ---
 
 ## What it does
